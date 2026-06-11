@@ -1,85 +1,59 @@
-# Memory Extractor Service
-import re
-from typing import List, Dict, Any
-from schemas.memory import UserMemory
+# memory_extractor.py
+import os
+import json
+from openai import OpenAI
 
-COUNTRIES = {
-    "Portugal",
-    "Spain",
-    "France",
-    "Germany",
-    "Italy",
-    "Netherlands",
-    "Belgium",
-    "England",
-    "Brazil",
-    "Argentina",
-    "Uruguay",
-}
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def extract_memory(message: str):
-    text = message.strip()
+def extract_memory(message: str) -> dict | None:
+    prompt = f"""
+    You are a memory extraction assistant for a football AI app.
 
-    # My name is John Doe
-    match = re.search(r"My name Is (.+)", text, re.IGNORECASE)
-    if match:
-        return {
-            "type": "name",
-            "value": match.group(1).strip()
-        }
+    Read this user message and extract any personal information worth remembering.
+    Return a JSON object with "type" and "value", or null if nothing is worth storing.
 
-    # My nickname is Johnny
-    match = re.search(r"My nickname Is (.+)", text, re.IGNORECASE) or re.search(r"Call me (.+)", text, re.IGNORECASE)
-    if match:
-        return {
-            "type": "nickname",
-            "value": match.group(1).strip()
-        }
+    Valid types:
+    - "name" → user's real name
+    - "nickname" → what they want to be called
+    - "favorite_club" → their club
+    - "favorite_player" → their favourite player
+    - "supported_country" → country they support internationally
+    - "prediction" → a match or tournament prediction
+    - "opinion" → a football opinion or take
 
-    # My favorite club is FC Barcelona
-    match = re.search(r"My favorite club Is (.+)", text, re.IGNORECASE) or re.search(r"I support (.+)", text, re.IGNORECASE)
-    if match:
-        value = match.group(1).strip()
+    Rules:
+    - Return ONLY a JSON object or null. No explanation, no markdown.
+    - If multiple things are mentioned, return the most significant one.
+    - For predictions and opinions, store the full message as the value.
 
-        if value.lower() in COUNTRIES:
-            return {
-                "type": "supported_country",
-                "value": value
-            }
-        return {
-            "type": "favorite_club",
-            "value": value
-        }
+    Examples:
+    Message: "I think Brazil will win the World Cup"
+    Output: {{"type": "prediction", "value": "Brazil will win the World Cup"}}
 
-    # My favorite player is Lionel Messi
-    match = re.search(r"My favorite player Is (.+)", text, re.IGNORECASE) or re.search(r"My favorite footballer Is (.+)", text, re.IGNORECASE)
-    if match:
-        return {
-            "type": "favorite_player",
-            "value": match.group(1).strip()
-        }
+    Message: "call me Triforce"
+    Output: {{"type": "nickname", "value": "Triforce"}}
 
-    # Prediction
-    if "will win" in text.lower() or "I predict" in text.lower() or "will lose" in text.lower() or "i think" in text.lower():
-        return {
-            "type": "prediction",
-            "value": text
-        }
+    Message: "what happened in the 1986 World Cup?"
+    Output: null
 
-    # Opinion
-    opinion_keywords = [
-        "In my opinion", 
-        "overrated", 
-        "underrated", 
-        "best team", 
-        "worst team"
-    ]
+    Message: "{message}"
+    Output:
+    """
 
-    for keyword in opinion_keywords:
-        if keyword.lower() in text.lower():
-            return {
-                "type": "opinion",
-                "value": text
-            }
-    
-    return None
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        if raw.lower() == "null" or not raw:
+            return None
+
+        return json.loads(raw)
+
+    except Exception as e:
+        print(f"[MemoryExtractor] error: {e}")
+        return None
