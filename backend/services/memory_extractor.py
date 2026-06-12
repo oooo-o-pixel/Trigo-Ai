@@ -1,11 +1,11 @@
 # memory_extractor.py
-import os
 import json
-from openai import OpenAI
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from services.ai_service import get_client
 
 def extract_memory(message: str) -> dict | None:
+    client = get_client()
+    if client is None:
+        return None  # no OPENAI_API_KEY — skip extraction rather than crash
     prompt = f"""
     You are a memory extraction assistant for a football AI app.
 

@@ -4,8 +4,10 @@ import os
 from walrus import WalrusClient
 from schemas.memory import UserMemory
 
-WALRUS_PUBLISHER_URL = os.getenv("WALRUS_PUBLISHER_URL", "https://walrus-mainnet-publisher.nodes.guru")
-WALRUS_AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", "https://walrus-mainnet-aggregator.nodes.guru")
+# Defaults are the official Walrus testnet endpoints (free public publisher).
+# Mainnet publishers require WAL payment — override via env vars when ready.
+WALRUS_PUBLISHER_URL = os.getenv("WALRUS_PUBLISHER_URL", "https://publisher.walrus-testnet.walrus.space")
+WALRUS_AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", "https://aggregator.walrus-testnet.walrus.space")
 
 client = WalrusClient(
     publisher_base_url=WALRUS_PUBLISHER_URL,

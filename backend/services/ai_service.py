@@ -3,7 +3,14 @@ from openai import OpenAI
 from schemas.memory import UserMemory
 from services.football_service import get_match_context_for_ai
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Lazy client so the API can boot (registration, profiles, memory) without a key.
+_client: OpenAI | None = None
+
+def get_client() -> OpenAI | None:
+    global _client
+    if _client is None and os.getenv("OPENAI_API_KEY"):
+        _client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return _client
 
 
 def build_system_prompt(user: UserMemory | None) -> str:
@@ -54,6 +61,10 @@ def build_system_prompt(user: UserMemory | None) -> str:
 
 
 def get_ai_reply(message: str, user: UserMemory | None = None) -> str:
+    client = get_client()
+    if client is None:
+        return "I'm warming up on the bench — the AI service isn't configured yet (missing OPENAI_API_KEY). Your message and memories are still being saved!"
+
     system_prompt = build_system_prompt(user)
 
     response = client.chat.completions.create(
@@ -68,6 +79,9 @@ def get_ai_reply(message: str, user: UserMemory | None = None) -> str:
 
 
 def generate_chat_title(first_message: str) -> str:
+    client = get_client()
+    if client is None:
+        return "Football Chat Session"
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
