@@ -2,7 +2,7 @@
 import json
 import os
 from walrus import WalrusClient
-from schemas.memory import UserMemory
+from api.schemas.memory import UserMemory
 
 # Defaults are the official Walrus testnet endpoints (free public publisher).
 # Mainnet publishers require WAL payment — override via env vars when ready.

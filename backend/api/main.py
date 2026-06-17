@@ -1,14 +1,15 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import threading
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 
-from services.ai_service import get_ai_reply, generate_chat_title
-from services.memory_extractor import extract_memory
-from services.memory_service import (
+from api.services.ai_service import get_ai_reply, generate_chat_title
+from api.services.memory_extractor import extract_memory
+from api.services.memory_service import (
     create_email_profile,
     create_wallet_profile,
     update_profile,
@@ -17,10 +18,11 @@ from services.memory_service import (
     get_profile,
     get_user_by_email,
     get_user_by_wallet_address,
-    add_chat_message,
+    add_chat_messages_batch,
     clear_chat_history,
     create_chat_session,
 )
+from database.neon_db import init_db
 
 app = FastAPI(
     title="Trigo-Ai",
@@ -28,9 +30,13 @@ app = FastAPI(
     version="1.0.0",
 )
 
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # update to your frontend domain after deployment
+    allow_origins=["http://localhost:5173",],  # update to your frontend domain after deployment
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -214,6 +220,14 @@ def delete_chat_history(user_id: str):
     return {"success": True, "message": "Chat history cleared"}
 
 
+@app.delete("/chat/{user_id}/{chat_id}")
+def delete_chat(user_id: str, chat_id: str):
+    success = delete_chat_session(user_id, chat_id)
+    if not success:
+        return {"success": False, "message": "User or chat session not found"}
+    return {"success": True, "message": "Chat session deleted"}
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(chat_request: ChatRequest):
     user = get_profile(chat_request.user_id)
@@ -231,47 +245,55 @@ def chat(chat_request: ChatRequest):
     )
     is_first_message = session is not None and len(session.messages) == 0
 
-    # extract and store memory
-    memory = extract_memory(chat_request.message)
-    if memory:
-        if memory["type"] in ["name", "nickname", "favorite_club", "favorite_player", "supported_country"]:
-            update_profile(chat_request.user_id, memory["type"], memory["value"])
-        elif memory["type"] == "prediction":
-            add_prediction(chat_request.user_id, memory["value"])
-        elif memory["type"] == "opinion":
-            add_opinion(chat_request.user_id, memory["value"])
-
-    # get AI reply
+    # get AI reply — only blocking call on the critical path
     reply = get_ai_reply(chat_request.message, user)
 
-    # save chat messages
-    add_chat_message(chat_request.user_id, chat_request.chat_id, "user", chat_request.message)
-    add_chat_message(chat_request.user_id, chat_request.chat_id, "assistant", reply)
+    # batch save both messages in one Walrus upload
+    add_chat_messages_batch(
+        chat_request.user_id,
+        chat_request.chat_id,
+        chat_request.message,
+        reply,
+    )
 
-    # generate title only on first message
-    chat_title = generate_chat_title(chat_request.message) if is_first_message else None
-
-    # update session title if first message
-    if is_first_message and chat_title:
-        user_updated = get_profile(chat_request.user_id)
-        if user_updated:
-            for s in user_updated.chat_sessions:
-                if s.chat_id == chat_request.chat_id:
-                    s.title = chat_title
-                    break
-            from services.memory_service import _persist
-            _persist(user_updated)
-
-    # refresh display name in case memory updated it
+    # refresh display name from cache (no Walrus fetch needed)
     updated_user = get_profile(chat_request.user_id)
     display_name = resolve_display_name(updated_user) if updated_user else None
 
+    # ── background: memory extraction + title generation (non-blocking) ────────
+    chat_title = None
+    if is_first_message:
+        chat_title = generate_chat_title(chat_request.message)
+        if chat_title:
+            user_updated = get_profile(chat_request.user_id)
+            if user_updated:
+                for s in user_updated.chat_sessions:
+                    if s.chat_id == chat_request.chat_id:
+                        s.title = chat_title
+                        break
+                from api.services.memory_service import _persist
+                _persist(user_updated)
+
+    def background_tasks():
+        # extract and store memory
+        memory = extract_memory(chat_request.message)
+        if memory:
+            if memory["type"] in ["name", "nickname", "favorite_club", "favorite_player", "supported_country"]:
+                update_profile(chat_request.user_id, memory["type"], memory["value"])
+            elif memory["type"] == "prediction":
+                add_prediction(chat_request.user_id, memory["value"])
+            elif memory["type"] == "opinion":
+                add_opinion(chat_request.user_id, memory["value"])
+
+    threading.Thread(target=background_tasks, daemon=True).start()
+    # ──────────────────────────────────────────────────────────────────────────
+
     return ChatResponse(
         success=True,
-        message="Memory updated!" if memory else "No memory extracted.",
-        memory_detected=memory,
+        message="Reply generated.",
+        memory_detected=None,
         user_id=chat_request.user_id,
         reply=reply,
         display_name=display_name,
-        chat_title=chat_title,
+        chat_title=chat_title,  # now returning the title on the first message
     )

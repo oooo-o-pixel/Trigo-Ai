@@ -1,6 +1,6 @@
 # memory_extractor.py
 import json
-from services.ai_service import get_client
+from api.services.ai_service import get_client
 
 def extract_memory(message: str) -> dict | None:
     client = get_client()

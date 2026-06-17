@@ -1,7 +1,7 @@
 import os
 from openai import OpenAI
-from schemas.memory import UserMemory
-from services.football_service import get_match_context_for_ai
+from api.schemas.memory import UserMemory
+from api.services.football_service import get_match_context_for_ai
 
 # Lazy client so the API can boot (registration, profiles, memory) without a key.
 _client: OpenAI | None = None
