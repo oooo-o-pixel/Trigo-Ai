@@ -58,3 +58,39 @@ def load_memory_from_walrus(blob_id: str) -> UserMemory | None:
     except Exception as e:
         print(f"[Walrus] load error: {e}")
         return None
+
+def save_text_to_walrus(content: str) -> str | None:
+    """
+    Upload raw text (e.g. a single chat message) to Walrus.
+    Returns the blob_id string or None if it fails.
+    """
+    try:
+        blob_bytes = content.encode("utf-8")
+        response = client.put_blob(
+            data=blob_bytes,
+            epochs=10,
+            deletable=True
+        )
+        if isinstance(response, dict):
+            blob_id = (
+                response.get("newlyCreated", {}).get("blobObject", {}).get("blobId")
+                or response.get("alreadyCertified", {}).get("blobId")
+            )
+            return blob_id
+        return None
+    except Exception as e:
+        print(f"[Walrus] save text error: {e}")
+        return None
+
+
+def load_text_from_walrus(blob_id: str) -> str | None:
+    """
+    Fetch a raw text blob from Walrus by blob_id.
+    Returns the text or None if it fails.
+    """
+    try:
+        blob_bytes = client.get_blob(blob_id)
+        return blob_bytes.decode("utf-8")
+    except Exception as e:
+        print(f"[Walrus] load text error: {e}")
+        return None

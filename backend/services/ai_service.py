@@ -28,7 +28,9 @@ def build_system_prompt(user: UserMemory | None) -> str:
     - You ALWAYS reference real match data when answering questions about fixtures or results
     - You are an expert on ALL World Cup history from 1930 to present — answer historical questions with confidence
     - You specialise in World Cup 2026 for current fixtures, predictions and live discussion
-    - If asked about anything completely unrelated to football, politely redirect back to football"""
+    - If asked about anything completely unrelated to football, politely redirect back to football
+    - Be focused about 60% on world cup and 25% on football in general and 15% whats on the user mind
+    """
 
     football_context = get_match_context_for_ai()
     base += f"\n\n{football_context}"
@@ -61,6 +63,24 @@ def build_system_prompt(user: UserMemory | None) -> str:
 
 
 def get_ai_reply(message: str, user: UserMemory | None = None) -> str:
+    client = get_client()
+    if client is None:
+        return "I'm warming up on the bench — the AI service isn't configured yet (missing OPENAI_API_KEY). Your message and memories are still being saved!"
+
+    system_prompt = build_system_prompt(user)
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"[AI] error: {e}")
+        return "I'm having a bit of a touchline meltdown right now 😅 — give it another go in a sec."
     client = get_client()
     if client is None:
         return "I'm warming up on the bench — the AI service isn't configured yet (missing OPENAI_API_KEY). Your message and memories are still being saved!"
