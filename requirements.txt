@@ -16,7 +16,6 @@ jiter==0.15.0
 openai==2.43.0
 psycopg2-binary==2.9.12
 email-validator>=2.0.0
-pydantic[email]
 pydantic==2.13.4
 pydantic_core==2.46.4
 python-dotenv==1.2.2
