@@ -9,6 +9,7 @@ from schemas.memory import UserMemory
 WALRUS_PUBLISHER_URL = os.getenv("WALRUS_PUBLISHER_URL", "https://publisher.walrus-testnet.walrus.space")
 WALRUS_AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", "https://aggregator.walrus-testnet.walrus.space")
 
+
 client = WalrusClient(
     publisher_base_url=WALRUS_PUBLISHER_URL,
     aggregator_base_url=WALRUS_AGGREGATOR_URL

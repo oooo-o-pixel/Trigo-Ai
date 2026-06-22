@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-pydantic
-email-validator
-python-dotenv
-openai
-walrus-python   # Walrus (Sui) blob storage client — NOT the "walrus" Redis package
