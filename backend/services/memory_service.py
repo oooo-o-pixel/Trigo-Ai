@@ -35,13 +35,29 @@ _pool = psycopg2.pool.SimpleConnectionPool(
 def get_conn():
     conn = _pool.getconn()
     try:
+        # Neon silently closes idle connections server-side. The pool doesn't
+        # know that, so probe with a cheap query and swap in a fresh
+        # connection if this one is already dead.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            _pool.putconn(conn, close=True)
+            conn = _pool.getconn()
+
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            pass
         raise
     finally:
-        _pool.putconn(conn)
+        try:
+            _pool.putconn(conn)
+        except Exception:
+            pass
 
 
 # ── Internal: build a full UserMemory from DB rows ────────────────────────────

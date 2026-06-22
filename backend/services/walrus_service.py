@@ -12,7 +12,8 @@ WALRUS_AGGREGATOR_URL = os.getenv("WALRUS_AGGREGATOR_URL", "https://aggregator.w
 
 client = WalrusClient(
     publisher_base_url=WALRUS_PUBLISHER_URL,
-    aggregator_base_url=WALRUS_AGGREGATOR_URL
+    aggregator_base_url=WALRUS_AGGREGATOR_URL,
+    timeout=120
 )
 
 
