@@ -34,8 +34,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # update to your frontend domain after deployment
-    allow_credentials=False,
+    allow_origins=["https://trigo-ai.netlify.app/chat"],  # update to your frontend domain after deployment
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
