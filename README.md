@@ -1,5 +1,7 @@
 # TRIGO-AI — World Cup 2026 Football Companion
 
+Note: This is for the backend infrastructure.
+
 TRIGO-AI is a chat backend that pairs an OpenAI-powered "football mate" persona with **live World Cup 2026 data** and **persistent per-user memory** (predictions, opinions, favourite club/player/country). It remembers who you support, what you predicted, and roasts (gently) or celebrates you when results come in — grounded in real fixtures, not invented ones.
 
 This README documents the services that exist in this codebase and how they fit together. The FastAPI route layer (`main.py`) wasn't part of this review, so exact endpoint signatures aren't documented here beyond what's been directly observed (`POST /register/email`, plus the auto-generated `/docs` and `/openapi.json`) — the live, authoritative route list is always visible at `/docs` (Swagger UI) once the app is running.
