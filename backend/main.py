@@ -34,7 +34,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://trigo-ai.netlify.app"],  # update to your frontend domain after deployment
+    allow_origins=["https://trigo-ai.netlify.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -193,20 +193,6 @@ def get_chat_history(user_id: str, chat_id: str):
         "title": result["title"],
         "messages": result["messages"]
     }
-    # user = get_profile(user_id)
-    # if not user:
-    #     return {"success": False, "message": "User not found"}
-    # session = next(
-    #     (s for s in user.chat_sessions if s.chat_id == chat_id), None
-    # )
-    # if not session:
-    #     return {"success": False, "message": "Chat session not found"}
-    # return {
-    #     "success": True,
-    #     "chat_id": chat_id,
-    #     "title": session.title,
-    #     "messages": session.messages
-    # }
 
 
 @app.delete("/chat/history/{user_id}")
@@ -235,17 +221,27 @@ def chat(chat_request: ChatRequest):
             message="User not found. Please register first.",
         )
 
-    # check if this is the first message in the session
+    # Find the current session
     session = next(
         (s for s in user.chat_sessions if s.chat_id == chat_request.chat_id),
         None
     )
     is_first_message = session is not None and len(session.messages) == 0
 
-    # get AI reply — only blocking call on the critical path
-    reply = get_ai_reply(chat_request.message, user)
+    # Build chat history from this session's stored messages.
+    # ChatMessage objects have .role and .content attributes.
+    # Cap at last 20 messages (10 back-and-forth turns) to stay within
+    # context limits and keep response times fast.
+    chat_history = []
+    if session and session.messages:
+        for msg in session.messages[-20:]:
+            if msg.role in ("user", "assistant") and msg.content:
+                chat_history.append({"role": msg.role, "content": msg.content})
 
-    # batch save both messages in one Walrus upload
+    # Get AI reply with full conversation history
+    reply = get_ai_reply(chat_request.message, user, chat_history=chat_history)
+
+    # Batch save both messages in one Walrus upload
     add_chat_messages_batch(
         chat_request.user_id,
         chat_request.chat_id,
@@ -253,13 +249,12 @@ def chat(chat_request: ChatRequest):
         reply,
     )
 
-    # refresh display name from cache (no Walrus fetch needed)
+    # Refresh display name
     updated_user = get_profile(chat_request.user_id)
     display_name = resolve_display_name(updated_user) if updated_user else None
 
-    # ── background: memory extraction + title generation (non-blocking) ────────
+    # Background: memory extraction + title generation (non-blocking)
     def background_tasks():
-        # extract and store memory
         memory = extract_memory(chat_request.message)
         if memory:
             if memory["type"] in ["name", "nickname", "favorite_club", "favorite_player", "supported_country"]:
@@ -268,8 +263,6 @@ def chat(chat_request: ChatRequest):
                 add_prediction(chat_request.user_id, memory["value"])
             elif memory["type"] == "opinion":
                 add_opinion(chat_request.user_id, memory["value"])
-
-        
 
     chat_title = None
 
@@ -297,5 +290,5 @@ def chat(chat_request: ChatRequest):
         user_id=chat_request.user_id,
         reply=reply,
         display_name=display_name,
-        chat_title=chat_title,  # title arrives async; frontend can poll /chat/sessions
+        chat_title=chat_title,
     )

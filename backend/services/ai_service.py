@@ -3,7 +3,6 @@ from openai import OpenAI
 from schemas.memory import UserMemory
 from services.football_service import get_match_context_for_ai
 
-# Lazy client so the API can boot (registration, profiles, memory) without a key.
 _client: OpenAI | None = None
 
 def get_client() -> OpenAI | None:
@@ -69,41 +68,37 @@ def build_system_prompt(user: UserMemory | None) -> str:
     return base
 
 
-def get_ai_reply(message: str, user: UserMemory | None = None) -> str:
+def get_ai_reply(message: str, user: UserMemory | None = None, chat_history: list | None = None) -> str:
     client = get_client()
     if client is None:
         return "I'm warming up on the bench — the AI service isn't configured yet (missing OPENAI_API_KEY). Your message and memories are still being saved!"
 
     system_prompt = build_system_prompt(user)
+
+    # Build messages array: system prompt + previous turns + current message
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if chat_history:
+        # chat_history is a list of {"role": "user"/"assistant", "content": "..."}
+        # Cap at last 20 messages (10 turns) to stay within context limits
+        for entry in chat_history[-20:]:
+            role = entry.get("role")
+            content = entry.get("content")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": message})
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.4,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message}
-            ]
+            messages=messages
         )
         return response.choices[0].message.content
     except Exception as e:
         print(f"[AI] error: {e}")
         return "I'm having a bit of a touchline meltdown right now 😅 — give it another go in a sec."
-    client = get_client()
-    if client is None:
-        return "I'm warming up on the bench — the AI service isn't configured yet (missing OPENAI_API_KEY). Your message and memories are still being saved!"
-
-    system_prompt = build_system_prompt(user)
-
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message}
-        ]
-    )
-
-    return response.choices[0].message.content
 
 
 def generate_chat_title(first_message: str) -> str:
