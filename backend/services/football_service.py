@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 import requests
 
-import scorer_store
+from services import scorer_store
 
 # ── API-Football (api-sports.io) ──────────────────────────────────────────────
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
