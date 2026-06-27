@@ -4,7 +4,7 @@ import express from "express";
 import type { Request, Response, NextFunction } from "express";
 import { MemWal } from "@mysten-incubation/memwal";
 
-const PORT = parseInt(process.env.BRIDGE_PORT ?? "4100");
+const PORT = parseInt(process.env.PORT ?? process.env.BRIDGE_PORT ?? "4100");
 const PRIVATE_KEY = process.env.MEMWAL_PRIVATE_KEY ?? "";
 const ACCOUNT_ID = process.env.MEMWAL_ACCOUNT_ID ?? "";
 const RELAYER_URL = process.env.MEMWAL_RELAYER_URL ?? "";
