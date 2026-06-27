@@ -1,31 +1,47 @@
 import os
-import json
-from uuid import uuid4
+import re
 import time
-import concurrent.futures
+import threading
 from datetime import datetime
 
+import requests
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor, Json
 from contextlib import contextmanager
-from services.walrus_service import (
-    save_memory_to_walrus, load_memory_from_walrus,
-    save_text_to_walrus, load_text_from_walrus,
-)
 
 from schemas.memory import UserMemory, ChatMessage, ChatSession
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-# Fields that live directly on the users table
+MEMWAL_BRIDGE_URL = os.environ.get("MEMWAL_BRIDGE_URL", "http://localhost:4100")
+
 USERS_TABLE_FIELDS = {"name", "nickname"}
-# Fields that live as rows in ai_memories (single-value, upserted)
 MEMORY_CATEGORY_FIELDS = {"favorite_club", "favorite_player", "supported_country"}
 
+# ── Smart filter ───────────────────────────────────────────────────────────────
+
+_REMEMBER_PATTERNS = re.compile(
+    r"\b("
+    r"i think|i believe|i predict|i reckon|my prediction|gonna win|will win|will lose|"
+    r"my favourite|my favorite|i support|i follow|i love|my team|my club|my player|"
+    r"my name is|call me|i'm called|i am called|"
+    r"best player|worst player|overrated|underrated|"
+    r"should have|shouldn't have|deserved|robbed|"
+    r"going through|knocked out|final|semi.?final|quarter.?final|"
+    r"messi|ronaldo|mbappe|haaland|neymar|salah|vinicius|bellingham|"
+    r"brazil|france|england|argentina|germany|spain|portugal|nigeria|"
+    r"world cup|champions league|premier league|la liga|serie a|bundesliga"
+    r")\b",
+    re.IGNORECASE,
+)
+
+def _is_worth_remembering(text: str) -> bool:
+    return bool(_REMEMBER_PATTERNS.search(text))
+
+
 # ── Connection pool ────────────────────────────────────────────────────────────
-# Reuses already-authenticated connections instead of opening a fresh
-# TCP+TLS+auth handshake to Neon on every single call.
+
 _pool = psycopg2.pool.SimpleConnectionPool(
     1, 10, DATABASE_URL, cursor_factory=RealDictCursor
 )
@@ -35,9 +51,6 @@ _pool = psycopg2.pool.SimpleConnectionPool(
 def get_conn():
     conn = _pool.getconn()
     try:
-        # Neon silently closes idle connections server-side. The pool doesn't
-        # know that, so probe with a cheap query and swap in a fresh
-        # connection if this one is already dead.
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -60,7 +73,40 @@ def get_conn():
             pass
 
 
-# ── Internal: build a full UserMemory from DB rows ────────────────────────────
+# ── MemWal bridge ──────────────────────────────────────────────────────────────
+
+def remember_to_memwal(user_id: str, text: str) -> None:
+    """Fire-and-forget: sends text to MemWal bridge in a background thread."""
+    def _send():
+        try:
+            requests.post(
+                f"{MEMWAL_BRIDGE_URL}/remember",
+                json={"namespace": user_id, "text": text},
+                timeout=120,
+            )
+        except Exception as e:
+            print(f"[MemWal] remember failed for user={user_id}: {e}")
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+def recall_from_memwal(user_id: str, query: str) -> list[str]:
+    """Blocking call before AI reply. Returns [] on any failure."""
+    try:
+        resp = requests.post(
+            f"{MEMWAL_BRIDGE_URL}/recall",
+            json={"namespace": user_id, "query": query},
+            timeout=8,
+        )
+        data = resp.json()
+        if data.get("success"):
+            return data.get("memories", [])
+    except Exception as e:
+        print(f"[MemWal] recall failed for user={user_id}: {e}")
+    return []
+
+
+# ── Internal helpers ───────────────────────────────────────────────────────────
 
 def _fetch_full_profile(user_id: str) -> UserMemory | None:
     with get_conn() as conn:
@@ -84,23 +130,13 @@ def _fetch_full_profile(user_id: str) -> UserMemory | None:
                 )
                 msg_rows = cur.fetchall()
 
-                # Fetch all Walrus blobs for this session in parallel instead
-                # of one-at-a-time — turns N sequential round-trips into 1
-                # batch of concurrent ones.
-                blob_ids = [m["walrus_blob_id"] for m in msg_rows]
-                if blob_ids:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                        contents = list(executor.map(load_text_from_walrus, blob_ids))
-                else:
-                    contents = []
-
                 messages = [
                     ChatMessage(
                         role=m["role"],
-                        content=content or "",
+                        content=m["content"] or "",
                         timestamp=m["timestamp"].isoformat() if m["timestamp"] else datetime.utcnow().isoformat()
                     )
-                    for m, content in zip(msg_rows, contents)
+                    for m in msg_rows
                 ]
 
                 chat_sessions.append(ChatSession(
@@ -147,8 +183,6 @@ def _fetch_full_profile(user_id: str) -> UserMemory | None:
         chat_sessions=chat_sessions,
     )
 
-
-# ── Persist (kept for main.py's direct title-sync calls) ──────────────────────
 
 def _persist(profile: UserMemory):
     with get_conn() as conn:
@@ -251,6 +285,7 @@ def add_opinion(user_id: str, opinion: str) -> UserMemory | None:
             )
     return get_profile(user_id)
 
+
 def get_chat_sessions_summary(user_id: str) -> list | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -279,6 +314,7 @@ def get_chat_sessions_summary(user_id: str) -> list | None:
         for r in rows
     ]
 
+
 def get_single_chat_history(user_id: str, chat_id: str) -> dict | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -291,59 +327,36 @@ def get_single_chat_history(user_id: str, chat_id: str) -> dict | None:
             cur.execute("SELECT title FROM chat_sessions WHERE chat_id = %s", (chat_id,))
             session_row = cur.fetchone()
             cur.execute(
-                "SELECT * FROM messages WHERE chat_id = %s ORDER BY timestamp ASC",
+                "SELECT role, content, timestamp FROM messages WHERE chat_id = %s ORDER BY timestamp ASC",
                 (chat_id,)
             )
             msg_rows = cur.fetchall()
 
-    blob_ids = [m["walrus_blob_id"] for m in msg_rows]
-    if blob_ids:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            contents = list(executor.map(load_text_from_walrus, blob_ids))
-    else:
-        contents = []
-
     messages = [
         {
             "role": m["role"],
-            "content": content or "",
+            "content": m["content"] or "",
             "timestamp": m["timestamp"].isoformat() if m["timestamp"] else None,
         }
-        for m, content in zip(msg_rows, contents)
+        for m in msg_rows
     ]
     return {"title": session_row["title"], "messages": messages}
 
-    blob_id = save_text_to_walrus_with_retry(content)
-    if not blob_id:
-        print(f"[Memory] Walrus save failed — message not persisted to Postgres")
-        return
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO messages (chat_id, role, walrus_blob_id) VALUES (%s, %s, %s)",
-                (chat_id, role, blob_id)
-            )
-
 
 def add_chat_messages_batch(user_id: str, chat_id: str, user_message: str, assistant_reply: str):
-    # Save both messages to Walrus in parallel instead of sequentially —
-    # halves the worst-case wait when Walrus is slow.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        user_future = executor.submit(save_text_to_walrus_with_retry, user_message)
-        reply_future = executor.submit(save_text_to_walrus_with_retry, assistant_reply)
-        user_blob_id = user_future.result()
-        reply_blob_id = reply_future.result()
-
-    if not user_blob_id or not reply_blob_id:
-        print(f"[Memory] Walrus save failed — message(s) not persisted to Postgres")
-        return
-
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO messages (chat_id, role, walrus_blob_id) VALUES (%s, 'user', %s), (%s, 'assistant', %s)",
-                (chat_id, user_blob_id, chat_id, reply_blob_id)
+                """
+                INSERT INTO messages (chat_id, role, content)
+                VALUES (%s, 'user', %s), (%s, 'assistant', %s)
+                """,
+                (chat_id, user_message, chat_id, assistant_reply)
             )
+
+    # Only store to MemWal if the message is worth remembering
+    if _is_worth_remembering(user_message):
+        remember_to_memwal(user_id, user_message)
 
 
 def clear_chat_history(user_id: str) -> bool:
@@ -369,17 +382,6 @@ def create_chat_session(user_id: str, title: str = "New Chat") -> str | None:
             row = cur.fetchone()
     return str(row["chat_id"])
 
-
-def save_text_to_walrus_with_retry(content: str, retries=1, delay=1) -> str | None:
-    # Kept short — this runs on the blocking /chat request path, so a slow
-    # retry loop here directly delays the user's reply.
-    for attempt in range(retries + 1):
-        blob_id = save_text_to_walrus(content)
-        if blob_id:
-            return blob_id
-        if attempt < retries:
-            time.sleep(delay)
-    return None
 
 def delete_chat_session(user_id: str, chat_id: str) -> bool:
     with get_conn() as conn:

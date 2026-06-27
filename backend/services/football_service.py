@@ -1,17 +1,17 @@
 # backend/services/football_service.py
 import os
+import re
+import json
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import requests
 
-# ── API-Football (api-sports.io) — used ONLY for lineups + goal events now ───
+# ── API-Football (api-sports.io) ──────────────────────────────────────────────
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
-WC_LEAGUE_ID = 1  # FIFA World Cup, fixed across seasons in API-Football v3
+WC_LEAGUE_ID = 1
 
-headers = {
-    "x-apisports-key": FOOTBALL_API_KEY
-}
+headers = {"x-apisports-key": FOOTBALL_API_KEY}
 
 DAILY_REQUEST_BUDGET = int(os.getenv("FOOTBALL_API_DAILY_BUDGET", "90"))
 _request_log = {"date": None, "count": 0}
@@ -45,8 +45,15 @@ def _get(endpoint: str, params: dict = None) -> dict:
 
 
 _lineup_cache: dict[int, list] = {}
-_events_cache: dict[int, list] = {}
 _fixture_id_cache: dict[tuple, int | None] = {}
+
+# Events get a TTL, unlike lineups/fixture-IDs which are cached forever.
+# Confirmed in testing: api-sports.io can post a goal's scorer immediately
+# but backfill the assist field a little later — caching the first
+# (assist-less) response forever would mean the app never picks up the
+# correction once it lands.
+_events_cache: dict[int, dict] = {}
+EVENTS_CACHE_TTL = int(os.getenv("FOOTBALL_EVENTS_CACHE_TTL", "1800"))  # 30 min
 
 
 def get_lineup(fixture_id: int) -> list:
@@ -59,12 +66,19 @@ def get_lineup(fixture_id: int) -> list:
 
 
 def get_match_events(fixture_id: int) -> list:
-    if fixture_id in _events_cache:
-        return _events_cache[fixture_id]
+    cached = _events_cache.get(fixture_id)
+    now = time.time()
+    if cached and (now - cached["timestamp"]) < EVENTS_CACHE_TTL:
+        return cached["data"]
+
     response = _get("/fixtures/events", {"fixture": fixture_id}).get("response", [])
     if response:
-        _events_cache[fixture_id] = response
-    return response
+        _events_cache[fixture_id] = {"data": response, "timestamp": now}
+        return response
+
+    # Fresh call failed or got skipped by the budget guard — serve the last
+    # good data rather than nothing, if we have any.
+    return cached["data"] if cached else []
 
 
 def _normalize_name(name: str) -> str:
@@ -120,15 +134,21 @@ def format_lineup_for_match(home_name: str, away_name: str, match_date: datetime
     return "\n".join(lines)
 
 
-def format_events_for_match(home_name: str, away_name: str, match_date: datetime) -> str:
+def _get_clean_scorers_from_api(home_name: str, away_name: str, match_date: datetime) -> dict | None:
+    """
+    Fetch goalscorer + assister names from api-sports.io events.
+    Returns {"home": [...], "away": [...]} or None if unavailable.
+    Verified against real match reporting — scorer/assist names and
+    substitution timing both checked out for the Norway-Senegal test case.
+    """
     fixture_id = _find_fixture_id(home_name, away_name, match_date)
     if fixture_id is None:
-        return ""
+        return None
     events = get_match_events(fixture_id)
     if not events:
-        return ""
+        return None
 
-    lines = []
+    home_scorers, away_scorers = [], []
     for ev in events:
         if ev.get("type") != "Goal":
             continue
@@ -137,24 +157,32 @@ def format_events_for_match(home_name: str, away_name: str, match_date: datetime
         minute_str = f"{minute}+{extra}'" if extra else f"{minute}'"
         team = ev.get("team", {}).get("name", "")
         scorer = ev.get("player", {}).get("name") or "Unknown"
-        assist = ev.get("assist", {}).get("name")
         detail = ev.get("detail", "")
+        # Sibling field to "player" — null for most penalties/own goals,
+        # present for open-play goals. This was previously never read at all.
+        assist_name = (ev.get("assist") or {}).get("name")
 
         if detail == "Own Goal":
-            lines.append(f"      {minute_str} — {scorer} (OWN GOAL, for {team})")
-        elif assist:
-            lines.append(f"      {minute_str} — {scorer} ({team}), assisted by {assist}")
+            entry = f"{scorer} {minute_str} (OG)"
+        elif detail == "Penalty":
+            entry = f"{scorer} {minute_str} (p)"
+        elif assist_name:
+            entry = f"{scorer} {minute_str} (assist: {assist_name})"
         else:
-            tag = " (penalty)" if detail == "Penalty" else ""
-            lines.append(f"      {minute_str} — {scorer} ({team}){tag}")
+            entry = f"{scorer} {minute_str}"
 
-    return "\n".join(lines)
+        if _names_match(team, home_name):
+            home_scorers.append(entry)
+        else:
+            away_scorers.append(entry)
+
+    return {"home": home_scorers, "away": away_scorers}
 
 
-# ── worldcup26.ir — scores, live status, fixtures, standings, bracket ────────
+# ── worldcup26.ir ─────────────────────────────────────────────────────────────
 WC26_BASE = "https://worldcup26.ir"
 
-_games_cache = {"data": None, "timestamp": 0, "ttl": 60}
+_games_cache = {"data": None, "timestamp": 0, "ttl": 300, "has_live": False}
 
 
 def _to_int(value):
@@ -164,10 +192,24 @@ def _to_int(value):
         return None
 
 
+def _parse_scorers(raw: str) -> list[str]:
+    if not raw or raw == "null":
+        return []
+    try:
+        json_str = raw.strip()
+        if json_str.startswith("{") and json_str.endswith("}"):
+            json_str = "[" + json_str[1:-1] + "]"
+        scorers = json.loads(json_str)
+        return [s.strip() for s in scorers if s.strip()]
+    except Exception:
+        return re.findall(r'"([^"]+)"', raw)
+
+
 def _fetch_games() -> list:
     cache = _games_cache
     now = time.time()
-    if cache["data"] is not None and (now - cache["timestamp"]) < cache["ttl"]:
+    current_ttl = 30 if cache.get("has_live") else cache["ttl"]
+    if cache["data"] is not None and (now - cache["timestamp"]) < current_ttl:
         return cache["data"]
     try:
         resp = requests.get(f"{WC26_BASE}/get/games", timeout=5)
@@ -175,6 +217,7 @@ def _fetch_games() -> list:
             games = resp.json().get("games", [])
             cache["data"] = games
             cache["timestamp"] = now
+            cache["has_live"] = any(g.get("time_elapsed") == "live" for g in games)
             return games
         print(f"[WorldCup26] {resp.status_code} fetching /get/games")
     except Exception as e:
@@ -186,24 +229,22 @@ def _parse_game(g: dict) -> dict | None:
     home = g.get("home_team_name_en")
     away = g.get("away_team_name_en")
     if not home or not away:
-        return None  # unresolved knockout slot placeholder
+        return None
     try:
         match_date = datetime.strptime(g["local_date"], "%m/%d/%Y %H:%M")
     except Exception:
         return None
 
-    # round field distinguishes group stage from knockout rounds.
-    # worldcup26.ir uses values like "Group Stage", "Round of 32",
-    # "Round of 16", "Quarter-finals", "Semi-finals", "Final".
-    # Anything that isn't "Group Stage" (and has no group letter) is knockout.
     raw_round = g.get("round") or ""
-    group = g.get("group") or None  # present only in group stage games
+    group = g.get("group") or None
 
     return {
         "home": home,
         "away": away,
         "home_score": _to_int(g.get("home_score")),
         "away_score": _to_int(g.get("away_score")),
+        "home_scorers": _parse_scorers(g.get("home_scorers", "")),
+        "away_scorers": _parse_scorers(g.get("away_scorers", "")),
         "status": g.get("time_elapsed"),
         "finished": g.get("finished") == "TRUE",
         "group": group,
@@ -218,13 +259,36 @@ def _get_parsed_games() -> list:
 
 
 def _is_knockout(m: dict) -> bool:
-    # A match is a knockout match if it has no group letter assigned.
-    # We also cross-check the round string as a safety net.
     no_group = not m.get("group")
     round_str = (m.get("round") or "").lower()
     knockout_keywords = ("round of", "quarter", "semi", "final", "third")
     round_is_knockout = any(k in round_str for k in knockout_keywords)
     return no_group or round_is_knockout
+
+
+def _format_scorers(m: dict) -> str:
+    """
+    Always tries api-sports.io first when there are goals, since it's the
+    only source with assist data — worldcup26.ir's scorer fields never
+    include assists, garbled-looking or not. Falls back to worldcup26.ir's
+    raw names only if api-sports.io has nothing for this fixture (daily
+    budget exhausted, fixture not found, etc.) — better than showing nothing.
+    """
+    home_scorers = m.get("home_scorers", [])
+    away_scorers = m.get("away_scorers", [])
+
+    if home_scorers or away_scorers:
+        clean = _get_clean_scorers_from_api(m["home"], m["away"], m["date"])
+        if clean and (clean["home"] or clean["away"]):
+            home_scorers = clean["home"]
+            away_scorers = clean["away"]
+
+    lines = []
+    for scorer in home_scorers:
+        lines.append(f"      ⚽ {scorer} ({m['home']})")
+    for scorer in away_scorers:
+        lines.append(f"      ⚽ {scorer} ({m['away']})")
+    return "\n".join(lines)
 
 
 def format_match(m: dict) -> str:
@@ -251,9 +315,8 @@ def get_upcoming_fixtures(limit: int = 5) -> list:
     return upcoming[:limit]
 
 
-# ── Bracket (knockout rounds) ─────────────────────────────────────────────────
+# ── Bracket ───────────────────────────────────────────────────────────────────
 
-# Round display order — earlier rounds first so the bracket reads top-to-bottom.
 _ROUND_ORDER = {
     "round of 32": 1,
     "round of 16": 2,
@@ -268,42 +331,29 @@ def _round_sort_key(round_str: str) -> int:
 
 
 def get_bracket() -> list:
-    """Return knockout matches grouped by round, sorted earliest-to-latest.
-    Each entry: {"round": str, "matches": [parsed_game, ...]}
-    Only includes rounds where at least one match has been scheduled
-    (i.e. both team names are resolved — no placeholder slots).
-    """
     knockout = [m for m in _get_parsed_games() if _is_knockout(m)]
     if not knockout:
         return []
-
-    # Group by round name
     rounds: dict[str, list] = {}
     for m in knockout:
         r = m.get("round") or "Knockout"
         rounds.setdefault(r, []).append(m)
-
-    # Sort matches within each round by date
     for r in rounds:
         rounds[r].sort(key=lambda m: m["date"])
-
-    # Sort rounds in bracket order
     sorted_rounds = sorted(rounds.items(), key=lambda kv: _round_sort_key(kv[0]))
     return [{"round": r, "matches": matches} for r, matches in sorted_rounds]
 
 
 def _format_bracket_match(m: dict) -> str:
-    """Single line for a knockout match, with result or TBD."""
     if m["home_score"] is not None and m["away_score"] is not None:
         result = f"{m['home_score']}-{m['away_score']}"
         if m["finished"]:
-            # Determine winner for clarity
             if m["home_score"] > m["away_score"]:
                 winner = m["home"]
             elif m["away_score"] > m["home_score"]:
                 winner = m["away"]
             else:
-                winner = "Draw/Penalties"  # AET/pens — score alone won't tell us
+                winner = "Draw/Penalties"
             return f"  {m['home']} {result} {m['away']}  → {winner} advances"
         else:
             return f"  {m['home']} {result} {m['away']}  [LIVE]"
@@ -311,8 +361,9 @@ def _format_bracket_match(m: dict) -> str:
     return f"  {m['home']} vs {m['away']}  [{date_str}]"
 
 
-# ── Standings (group stage) ───────────────────────────────────────────────────
-_groups_cache = {"data": None, "timestamp": 0, "ttl": 900}
+# ── Standings ─────────────────────────────────────────────────────────────────
+
+_groups_cache = {"data": None, "timestamp": 0, "ttl": 300}
 
 
 def _fetch_groups() -> list:
@@ -349,7 +400,6 @@ def get_standings() -> list:
     groups = _fetch_groups()
     if not groups:
         return []
-
     name_map = _build_team_name_map()
     result = []
     for g in groups:
@@ -365,18 +415,8 @@ def get_standings() -> list:
             })
         rows.sort(key=lambda r: (-r["points"], -r["gd"], -r["gf"]))
         result.append({"group": g.get("name"), "rows": rows})
-
     result.sort(key=lambda grp: grp["group"] or "")
     return result
-
-
-def _group_stage_complete() -> bool:
-    """True once every group-stage match is finished.
-    Used to decide whether to show standings or bracket in context."""
-    group_matches = [m for m in _get_parsed_games() if not _is_knockout(m)]
-    if not group_matches:
-        return False
-    return all(m["finished"] for m in group_matches)
 
 
 # ── Main context builder ──────────────────────────────────────────────────────
@@ -391,9 +431,9 @@ def get_match_context_for_ai() -> str:
         context_parts.append("\n🔴 LIVE NOW:")
         for m in live:
             context_parts.append(f"  - {format_match(m)}")
-            events_text = format_events_for_match(m["home"], m["away"], m["date"])
-            if events_text:
-                context_parts.append(f"      Goals so far:\n{events_text}")
+            scorers = _format_scorers(m)
+            if scorers:
+                context_parts.append(f"      Goals so far:\n{scorers}")
             lineup_text = format_lineup_for_match(m["home"], m["away"], m["date"])
             if lineup_text:
                 context_parts.append(lineup_text)
@@ -404,17 +444,9 @@ def get_match_context_for_ai() -> str:
         context_parts.append("\n✅ RECENT RESULTS:")
         for m in recent:
             context_parts.append(f"  - {format_match(m)}")
-
-        last_match = recent[-1]
-        events_text = format_events_for_match(last_match["home"], last_match["away"], last_match["date"])
-        if events_text:
-            context_parts.append(f"\n  Goals in the last match ({format_match(last_match)}):")
-            context_parts.append(events_text)
-
-        lineup_text = format_lineup_for_match(last_match["home"], last_match["away"], last_match["date"])
-        if lineup_text:
-            context_parts.append(f"\n  Lineups from the last match ({format_match(last_match)}):")
-            context_parts.append(lineup_text)
+            scorers = _format_scorers(m)
+            if scorers:
+                context_parts.append(scorers)
 
     upcoming = get_upcoming_fixtures(5)
     if upcoming:
@@ -423,9 +455,6 @@ def get_match_context_for_ai() -> str:
         for m in upcoming:
             context_parts.append(f"  - {format_match(m)}")
 
-    # Show group standings during group stage, bracket once knockouts begin.
-    # During the crossover period (group stage finishing + Round of 32 starting)
-    # both sections can appear simultaneously — that's intentional and useful.
     standings = get_standings()
     if standings:
         has_real_data = True
@@ -450,10 +479,13 @@ def get_match_context_for_ai() -> str:
     if has_real_data:
         snapshot_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         context_parts.insert(1, (
-            f"[LIVE DATA — snapshot taken {snapshot_time}. Scores, live status, "
-            f"standings, and bracket from worldcup26.ir; lineups and goal events from "
-            f"api-sports.io. Treat everything below as the current source of "
-            f"truth for the 2026 tournament.]"
+            f"[LIVE DATA — snapshot taken {snapshot_time}. Scores, results, "
+            f"standings, and bracket from worldcup26.ir; goalscorer names, "
+            f"assists, and lineups from api-sports.io where available. Use "
+            f"ONLY the data below for any 2026 World Cup scores, goalscorers, "
+            f"assists, or results — NEVER invent or guess these details. If a "
+            f"match or scorer is not listed below, say you don't have that "
+            f"confirmed rather than making it up.]"
         ))
     else:
         context_parts.append("""

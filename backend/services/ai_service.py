@@ -2,6 +2,7 @@ import os
 from openai import OpenAI
 from schemas.memory import UserMemory
 from services.football_service import get_match_context_for_ai
+from services.memory_service import recall_from_memwal
 
 _client: OpenAI | None = None
 
@@ -12,7 +13,9 @@ def get_client() -> OpenAI | None:
     return _client
 
 
-def build_system_prompt(user: UserMemory | None) -> str:
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+def build_system_prompt(user: UserMemory | None, semantic_memories: list[str] | None = None) -> str:
     base = """You are TRIGO-AI, a good mate who happens to be seriously clued-up on football and the World Cup 2026.
     Talk like you're texting a friend, not briefing a press conference — warm, easygoing, genuinely interested in them, with sharp football knowledge underneath.
 
@@ -26,7 +29,7 @@ def build_system_prompt(user: UserMemory | None) -> str:
     - You are an expert on ALL World Cup history from 1930 to present — answer historical questions with confidence
     - You specialise in World Cup 2026 for current fixtures, predictions and live discussion
     - If asked about anything completely unrelated to football, steer back gently and warmly, not curtly
-    - Be focused about 60% on world cup and 25% on football in general and 15% whats on the user mind
+    - Be focused about 60 percent on world cup and 25 percent on football in general and 15% whats on the user mind
     """
 
     football_context = get_match_context_for_ai()
@@ -39,6 +42,8 @@ def build_system_prompt(user: UserMemory | None) -> str:
 - If it's marked [NO LIVE DATA AVAILABLE], avoid stating a specific 2026 score, result, lineup, or standing as a hard fact — it's fine to chat, speculate, or give your honest take, just be upfront that you're not looking at confirmed live data on that right now.
 - If it's marked [LIVE DATA], lean on what's actually in there for anything specific (scores, lineups, standings). If someone asks about something not covered in the block, just say you don't have that particular detail confirmed rather than making it up — but you can still riff, have opinions, and talk tactics generally.
 - Your training data predates this tournament, so treat the data block as more reliable than your own memory for anything happening in it right now.
+- Always check other sources for the information you get to confirm if it is the correct information.
+- Always double check your responses to confirm if correct.
 - World Cup history from 1930-2022 is fair game from your own knowledge, no need to hedge there."""
 
     if not user:
@@ -65,22 +70,31 @@ def build_system_prompt(user: UserMemory | None) -> str:
         memory_block = "\n".join(memory_lines)
         base += f"\n\n=== USER MEMORY ===\n{memory_block}\n\nUse this to personalise your responses like a friend who remembers things — bring up their predictions naturally when results come in, tease them lightly if they were wrong, celebrate properly if they were right. Address them by name if you know it, and check in on them like a friend would, not just a stats machine."
 
+    # Semantic memories from MemWal — things the user said in past sessions
+    if semantic_memories:
+        semantic_block = "\n".join(f"- {m}" for m in semantic_memories)
+        base += f"\n\n=== THINGS THIS USER HAS SAID BEFORE (from past chats) ===\n{semantic_block}\n\nReference these naturally when relevant — like a mate who actually remembers past conversations. Don't quote them back robotically, just let them inform how you respond."
+
     return base
 
+
+# ── AI reply ──────────────────────────────────────────────────────────────────
 
 def get_ai_reply(message: str, user: UserMemory | None = None, chat_history: list | None = None) -> str:
     client = get_client()
     if client is None:
         return "I'm warming up on the bench — the AI service isn't configured yet (missing OPENAI_API_KEY). Your message and memories are still being saved!"
 
-    system_prompt = build_system_prompt(user)
+    # Pull relevant past memories from MemWal before building the prompt
+    semantic_memories = []
+    if user:
+        semantic_memories = recall_from_memwal(user.user_id, message)
 
-    # Build messages array: system prompt + previous turns + current message
+    system_prompt = build_system_prompt(user, semantic_memories)
+
     messages = [{"role": "system", "content": system_prompt}]
 
     if chat_history:
-        # chat_history is a list of {"role": "user"/"assistant", "content": "..."}
-        # Cap at last 20 messages (10 turns) to stay within context limits
         for entry in chat_history[-20:]:
             role = entry.get("role")
             content = entry.get("content")
@@ -101,6 +115,47 @@ def get_ai_reply(message: str, user: UserMemory | None = None, chat_history: lis
         return "I'm having a bit of a touchline meltdown right now 😅 — give it another go in a sec."
 
 
+def stream_ai_reply(message: str, user: UserMemory | None = None, chat_history: list | None = None):
+    """Generator version — yields text chunks as they arrive."""
+    client = get_client()
+    if client is None:
+        yield "I'm warming up on the bench — the AI service isn't configured yet (missing OPENAI_API_KEY). Your message and memories are still being saved!"
+        return
+
+    # Pull relevant past memories from MemWal before building the prompt
+    semantic_memories = []
+    if user:
+        semantic_memories = recall_from_memwal(user.user_id, message)
+
+    system_prompt = build_system_prompt(user, semantic_memories)
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if chat_history:
+        for entry in chat_history[-20:]:
+            role = entry.get("role")
+            content = entry.get("content")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": message})
+
+    try:
+        stream = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.4,
+            messages=messages,
+            stream=True,
+        )
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    except Exception as e:
+        print(f"[AI stream] error: {e}")
+        yield "I'm having a bit of a touchline meltdown right now 😅 — give it another go in a sec."
+
+
 def generate_chat_title(first_message: str) -> str:
     client = get_client()
     if client is None:
@@ -110,7 +165,7 @@ def generate_chat_title(first_message: str) -> str:
             model="gpt-4o-mini",
             messages=[{
                 "role": "user",
-                "content": f"Generate a short 4-word football chat title for this opening message. Return only the title, no punctuation, no quotes: '{first_message}'"
+                "content": f"Generate a unique short 4-word football chat title for this opening message. Return only the title, no punctuation, no quotes: '{first_message}'"
             }],
             temperature=0.7
         )
