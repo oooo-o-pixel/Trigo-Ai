@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+
 import threading
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -26,6 +27,8 @@ from services.memory_service import (
     get_single_chat_history,
     delete_chat_session,
 )
+from services import scorer_store
+scorer_store.init_scorer_table()
 
 app = FastAPI(
     title="Trigo-Ai",

@@ -6,6 +6,8 @@ import time
 from datetime import datetime, timezone
 import requests
 
+import scorer_store
+
 # ── API-Football (api-sports.io) ──────────────────────────────────────────────
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 BASE_URL = "https://v3.football.api-sports.io"
@@ -55,6 +57,19 @@ _fixture_id_cache: dict[tuple, int | None] = {}
 _events_cache: dict[int, dict] = {}
 EVENTS_CACHE_TTL = int(os.getenv("FOOTBALL_EVENTS_CACHE_TTL", "1800"))  # 30 min
 
+# Free tier only allows querying fixtures within a small rolling window
+# around "today" (confirmed via live error: a ~3-day window, roughly
+# yesterday through tomorrow). Calls outside this range always fail
+# with a plan error — skip them rather than waste budget and silently
+# fall back to garbled names.
+FIXTURE_DATE_WINDOW_DAYS = 1
+
+
+def _within_allowed_date_window(match_date: datetime) -> bool:
+    today = datetime.now(timezone.utc).date()
+    delta = abs((match_date.date() - today).days)
+    return delta <= FIXTURE_DATE_WINDOW_DAYS
+
 
 def get_lineup(fixture_id: int) -> list:
     if fixture_id in _lineup_cache:
@@ -96,6 +111,12 @@ def _find_fixture_id(home_name: str, away_name: str, match_date: datetime) -> in
     key = (home_name, away_name, match_date.date().isoformat())
     if key in _fixture_id_cache:
         return _fixture_id_cache[key]
+
+    if not _within_allowed_date_window(match_date):
+        # Outside free-tier date range — don't bother calling, it'll
+        # always fail with a plan error on this tier.
+        _fixture_id_cache[key] = None
+        return None
 
     response = _get("/fixtures", {
         "date": match_date.strftime("%Y-%m-%d"),
@@ -159,7 +180,7 @@ def _get_clean_scorers_from_api(home_name: str, away_name: str, match_date: date
         scorer = ev.get("player", {}).get("name") or "Unknown"
         detail = ev.get("detail", "")
         # Sibling field to "player" — null for most penalties/own goals,
-        # present for open-play goals. This was previously never read at all.
+        # present for open-play goals.
         assist_name = (ev.get("assist") or {}).get("name")
 
         if detail == "Own Goal":
@@ -268,20 +289,34 @@ def _is_knockout(m: dict) -> bool:
 
 def _format_scorers(m: dict) -> str:
     """
-    Always tries api-sports.io first when there are goals, since it's the
-    only source with assist data — worldcup26.ir's scorer fields never
-    include assists, garbled-looking or not. Falls back to worldcup26.ir's
-    raw names only if api-sports.io has nothing for this fixture (daily
-    budget exhausted, fixture not found, etc.) — better than showing nothing.
+    Resolution order for scorer/assist data:
+      1. Permanent Postgres store (scorer_store) — survives the free-tier
+         date window closing and survives server restarts.
+      2. Live api-sports.io lookup — only works while the match is inside
+         the free-tier rolling date window. If it succeeds, the clean
+         result is written to scorer_store so it's available forever
+         after this point, even once the window closes.
+      3. worldcup26.ir raw names — last resort, no assist data, names can
+         be garbled for some players.
     """
     home_scorers = m.get("home_scorers", [])
     away_scorers = m.get("away_scorers", [])
 
-    if home_scorers or away_scorers:
+    if not (home_scorers or away_scorers):
+        return ""
+
+    date_iso = m["date"].date().isoformat()
+
+    stored = scorer_store.get_stored_scorers(m["home"], m["away"], date_iso)
+    if stored and (stored["home"] or stored["away"]):
+        home_scorers = stored["home"]
+        away_scorers = stored["away"]
+    else:
         clean = _get_clean_scorers_from_api(m["home"], m["away"], m["date"])
         if clean and (clean["home"] or clean["away"]):
             home_scorers = clean["home"]
             away_scorers = clean["away"]
+            scorer_store.store_scorers(m["home"], m["away"], date_iso, clean["home"], clean["away"])
 
     lines = []
     for scorer in home_scorers:
