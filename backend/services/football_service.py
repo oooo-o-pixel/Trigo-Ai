@@ -449,6 +449,13 @@ def get_match_context_for_ai() -> str:
             scorers = _format_scorers(m)
             if scorers:
                 context_parts.append(scorers)
+            # Previously only fetched for LIVE matches — finished matches never
+            # got lineup data at all, so the AI had nothing real to work with
+            # and would occasionally hallucinate a full XI instead of saying
+            # "I don't have that." Fetching it here closes that gap.
+            lineup_text = format_lineup_for_match(m["home"], m["away"], m["date"])
+            if lineup_text:
+                context_parts.append(lineup_text)
 
     upcoming = get_upcoming_fixtures(5)
     if upcoming:
@@ -485,9 +492,9 @@ def get_match_context_for_ai() -> str:
             f"standings, and bracket from worldcup26.ir; goalscorer names, "
             f"assists, and lineups from api-sports.io where available. Use "
             f"ONLY the data below for any 2026 World Cup scores, goalscorers, "
-            f"assists, or results — NEVER invent or guess these details. If a "
-            f"match or scorer is not listed below, say you don't have that "
-            f"confirmed rather than making it up.]"
+            f"assists, lineups, or results — NEVER invent or guess these "
+            f"details. If a match, scorer, or lineup is not listed below, say "
+            f"you don't have that confirmed rather than making it up.]"
         ))
     else:
         context_parts.append("""
